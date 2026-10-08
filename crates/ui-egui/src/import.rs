@@ -122,6 +122,9 @@ pub struct ImportTask {
     auto: bool,
     /// Auto Import: the selection to keep.
     keep_selection: Option<lightcraft_engine::Selection>,
+    /// A temporary status message owned by this import.  Clear it when the import completes, but
+    /// only if another operation has not replaced it meanwhile.
+    completion_status: Option<String>,
     run: Option<ImportRun>,
 }
 
@@ -135,6 +138,11 @@ impl ImportTask {
     pub fn auto(mut self) -> Self {
         self.auto = true;
         self
+    }
+
+    /// Associate a temporary operation-status label with this import.
+    pub fn clear_status_when_finished(&mut self, status: String) {
+        self.completion_status = Some(status);
     }
 
     /// `{done, total, imported, cancelled}` for `ui.inspect`.
@@ -585,6 +593,9 @@ fn commit_batch(app: &mut LightcraftApp, task: &mut ImportTask, prepared: lightc
 
 /// The import is done (or cancelled): one undo step, select the first photo, say what happened.
 fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
+    if task.completion_status.as_deref().is_some_and(|status| app.ui.status == status) {
+        app.ui.status.clear();
+    }
     let steps = app.session.undo.len().saturating_sub(task.undo0);
     let label = crate::i18n::tr_format!("Add {} Photo{}", task.imported, if task.imported == 1 { "" } else { "s" });
     app.session.merge_undo(steps, &label);

@@ -983,7 +983,11 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                         let paths = entries.into_iter().map(|entry| entry.path).collect();
                         match crate::import::start_paths(app, paths) {
                             Ok(_) => {
-                                app.ui.status = format!("Importing {count} photo(s) from Lightroom catalog");
+                                let status = format!("Importing {count} photo(s) from Lightroom catalog");
+                                if let Some(import) = app.import.as_mut() {
+                                    import.clear_status_when_finished(status.clone());
+                                }
+                                app.ui.status = status;
                                 app.toast(ctx, format!("Lightroom catalog read: importing {count} photo(s)"));
                             }
                             Err(e) => {

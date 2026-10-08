@@ -175,3 +175,36 @@ fn import_reads_files_off_the_ui_thread_and_can_be_cancelled() {
     assert_eq!(calls.on(ui_thread), 0, "files were never read on the UI thread");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn import_clears_its_catalog_status_after_finishing() {
+    let dir = std::env::temp_dir().join(format!("lc-ui-catalog-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("IMG_001.jpg");
+    std::fs::write(&path, "not really a jpeg").unwrap();
+    let mut session = Session::new();
+    session.media.file_probe = Some(Arc::new(|path: &str| {
+        Ok(lightcraft_engine::media::ProbeInfo {
+            width: 60,
+            height: 40,
+            format: "JPEG".into(),
+            content_hash: Some(path.into()),
+            ..Default::default()
+        })
+    }));
+    let app = LightcraftApp::new(session, Services { png: None, ..Default::default() });
+    let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
+    crate::import::start_paths(&mut h.app, vec![path.to_string_lossy().to_string()]).unwrap();
+    let status = "Importing 1 photo(s) from Lightroom catalog".to_string();
+    h.app.import.as_mut().unwrap().clear_status_when_finished(status.clone());
+    h.app.ui.status = status;
+    let t0 = Instant::now();
+    while h.app.import.is_some() && t0.elapsed() < Duration::from_secs(10) {
+        h.step();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(h.app.import.is_none(), "finished importing");
+    assert!(h.app.ui.status.is_empty(), "catalog import status was cleared");
+    let _ = std::fs::remove_dir_all(&dir);
+}
