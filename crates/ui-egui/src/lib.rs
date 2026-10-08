@@ -78,6 +78,8 @@ pub type HostAction = Box<dyn FnMut(&mut Session) -> Result<Value, String>>;
 pub struct Services {
     /// Show an open dialog for photos; returns paths.
     pub pick_files: Option<PickFiles>,
+    /// Open dialog for a Lightroom Classic catalog (`.lrcat`).
+    pub pick_lightroom_catalog: Option<PickFiles>,
     /// Open dialog for preset files (`.lcpreset`, `.xmp`, `.lrtemplate`, `.zip`, `.dng`, Luminar `.lmp` / `.mplumpack`).
     pub pick_preset_files: Option<PickFiles>,
     /// Open dialog for a GPS track log (`.gpx`; Photo ▸ Auto-Tag from Tracklog…).

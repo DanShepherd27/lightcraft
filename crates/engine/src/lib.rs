@@ -25,6 +25,7 @@ pub mod guard;
 pub mod import;
 mod import_move;
 pub mod library;
+pub mod lrcat;
 pub mod media;
 pub mod memory;
 pub mod merge;

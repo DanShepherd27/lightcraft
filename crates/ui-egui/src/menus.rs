@@ -962,6 +962,14 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             // review first: the import dialog lists what was found
             crate::import::open(app, paths)
         }
+        "library.importLightroomCatalog" => {
+            let path = match p.get("path").and_then(Value::as_str) {
+                Some(path) => Some(path.to_string()),
+                None => app.services.pick_lightroom_catalog.as_mut().and_then(|f| f().into_iter().next()),
+            };
+            let Some(path) = path else { return Some(Ok(Value::Null)) };
+            app.run("library.importLightroomCatalog", json!({"path": path}))
+        }
         "app.quit" => {
             app.ui.quit = true;
             Ok(Value::Null)

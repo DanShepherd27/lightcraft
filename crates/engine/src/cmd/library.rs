@@ -1,7 +1,10 @@
 //! Library commands: view source, filter/sort, selection, ratings/flags/labels, rotate, delete,
 //! metadata, albums, import.
 
-use lightcraft_catalog::{Album, AlbumId, ColorLabel, CopyrightStatus, Flag, GroupBy, Op, PhotoId, Sort, SortKey};
+use std::collections::HashMap;
+use std::path::Path;
+
+use lightcraft_catalog::{Album, AlbumId, ColorLabel, CopyrightStatus, Flag, GroupBy, Op, PhotoId, Sort, SortKey, Source};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, bool_or, cmd, has_active, has_selection, ok, str_param};
@@ -112,6 +115,61 @@ fn album_param(p: &Value, key: &str, c: &str) -> Result<AlbumId> {
 
 fn strs(p: &Value, key: &str) -> Vec<String> {
     p.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// Import a Lightroom Classic catalog without changing it or writing sidecars beside its photos.
+fn import_lightroom_catalog(s: &mut Session, path: &str) -> Result<Value> {
+    let entries = crate::lrcat::Catalog::open(Path::new(path)).and_then(|c| c.entries()).map_err(|e| bad("library.importLightroomCatalog", e))?;
+    let packets: HashMap<String, String> = entries.iter().filter_map(|e| e.xmp.as_ref().map(|x| (e.path.clone(), x.clone()))).collect();
+    let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+    let mut report = crate::import::import(s, &paths, crate::import::ImportMode::Add)?;
+    let now = (s.clock)();
+    let mut ops = Vec::new();
+    let mut xmp_applied = 0usize;
+    let mut xmp_failed = 0usize;
+    for raw_id in &report.imported {
+        let id = PhotoId(*raw_id);
+        let Some(before) = s.catalog.photo(id).map(|p| (**p).clone()) else { continue };
+        let Source::File { path } = &before.source else { continue };
+        let Some(packet) = packets.get(path) else { continue };
+        let Ok(sidecar) = crate::sidecar::parse_sidecar(packet, before.kind == lightcraft_catalog::MediaKind::Raw) else {
+            xmp_failed += 1;
+            continue;
+        };
+        let sidecar = sidecar.resolve_label(&s.catalog);
+        let mut after = before.clone();
+        crate::sidecar::merge_into(&mut after, &sidecar, &now);
+        if after.rating != before.rating {
+            ops.push(Op::SetRating { id, rating: after.rating });
+        }
+        if after.flag != before.flag {
+            ops.push(Op::SetFlag { id, flag: after.flag });
+        }
+        if after.label != before.label {
+            ops.push(Op::SetLabel { id, label: after.label });
+        }
+        if after.meta != before.meta {
+            ops.push(Op::SetMeta { id, meta: Box::new(after.meta.clone()) });
+        }
+        if after.develop != before.develop {
+            ops.push(Op::SetDevelop {
+                id,
+                settings: after.develop.clone(),
+                label: "Imported Lightroom settings".into(),
+                edited: after.edited.clone(),
+            });
+        }
+        xmp_applied += 1;
+    }
+    if !ops.is_empty() {
+        s.commit("Apply Lightroom catalog metadata", Op::Batch { ops })?;
+    }
+    report.sidecars += xmp_applied;
+    let mut result = serde_json::to_value(report).unwrap_or_default();
+    result["catalogEntries"] = json!(entries.len());
+    result["xmpApplied"] = json!(xmp_applied);
+    result["xmpFailed"] = json!(xmp_failed);
+    Ok(result)
 }
 
 fn ids_param(p: &Value) -> Option<Vec<PhotoId>> {
@@ -972,6 +1030,31 @@ pub fn specs() -> Vec<CommandSpec> {
                 s.merge_undo(n, &format!("Add {} Photo{}", imported.len(), if imported.len() == 1 { "" } else { "s" }));
                 if let Some(f) = imported.first() {
                     s.selection = Selection::single(PhotoId(*f));
+                }
+                Ok(report)
+            }
+        ),
+        cmd!(
+            "library.importLightroomCatalog",
+            "Import Lightroom Classic Catalog…",
+            ["File"],
+            None,
+            "{path: .lrcat file} — reads the Lightroom Classic catalog without modifying it, imports its referenced photos in place, and applies the catalog's embedded XMP metadata and supported Develop settings. Original photos, existing XMP sidecars and the .lrcat are never written. Missing photos and unsupported/corrupt XMP are reported → {imported, duplicates, failed, catalogEntries, xmpApplied, xmpFailed}",
+            always,
+            |s, p| {
+                let path = str_param(p, "path")
+                    .filter(|p| !p.trim().is_empty())
+                    .ok_or_else(|| bad("library.importLightroomCatalog", "missing .lrcat `path`"))?;
+                if !path.to_ascii_lowercase().ends_with(".lrcat") {
+                    return Err(bad("library.importLightroomCatalog", "path must name a .lrcat Lightroom Classic catalog"));
+                }
+                let undo0 = s.undo.len();
+                let report = import_lightroom_catalog(s, path)?;
+                let imported: Vec<u64> = report["imported"].as_array().map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
+                let n = s.undo.len().saturating_sub(undo0);
+                s.merge_undo(n, &format!("Import Lightroom Catalog ({} Photo{})", imported.len(), if imported.len() == 1 { "" } else { "s" }));
+                if let Some(id) = imported.first() {
+                    s.selection = Selection::single(PhotoId(*id));
                 }
                 Ok(report)
             }
