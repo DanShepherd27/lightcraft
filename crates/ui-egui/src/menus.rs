@@ -968,20 +968,41 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 None => app.services.pick_lightroom_catalog.as_mut().and_then(|f| f().into_iter().next()),
             };
             let Some(path) = path else { return Some(Ok(Value::Null)) };
-            app.ui.status = format!("Importing Lightroom catalog: {}", path);
-            // Dispatch directly to the engine. Calling `app.run` here would
-            // re-enter this UI command handler with the same id indefinitely.
-            let result = app.session.execute("library.importLightroomCatalog", &json!({"path": path})).map_err(|e| e.to_string());
-            if let Err(e) = &result {
-                log::warn!("library.importLightroomCatalog: {e}");
-                app.ui.status = e.clone();
-            } else if let Ok(report) = &result {
-                let imported = report["imported"].as_array().map_or(0, Vec::len);
-                let failed = report["failed"].as_array().map_or(0, Vec::len);
-                let xmp = report["xmpApplied"].as_u64().unwrap_or(0);
-                app.ui.status = format!("Lightroom catalog imported: {imported} photo(s), {xmp} metadata record(s), {failed} failed");
+            if app.import.is_some() || app.tasks.is_running("Import Lightroom Catalog") {
+                return Some(Err("an import is already running".into()));
             }
-            result
+            app.ui.status = format!("Reading Lightroom catalog: {path}");
+            let worker_path = path.clone();
+            let result = crate::tasks::spawn(
+                app,
+                "Import Lightroom Catalog",
+                move || lightcraft_engine::lrcat::Catalog::open(std::path::Path::new(&worker_path)).and_then(|catalog| catalog.entries()),
+                move |app, ctx, entries| match entries {
+                    Ok(entries) => {
+                        let count = entries.len();
+                        let paths = entries.into_iter().map(|entry| entry.path).collect();
+                        match crate::import::start_paths(app, paths) {
+                            Ok(_) => {
+                                app.ui.status = format!("Importing {count} photo(s) from Lightroom catalog");
+                                app.toast(ctx, format!("Lightroom catalog read: importing {count} photo(s)"));
+                            }
+                            Err(e) => {
+                                app.ui.status = format!("Lightroom import failed: {e}");
+                                app.toast_error(ctx, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.ui.status = format!("Lightroom catalog could not be read: {e}");
+                        app.toast_error(ctx, e);
+                    }
+                },
+            );
+            if let Err(e) = result {
+                app.ui.status = format!("Lightroom import could not start: {e}");
+                return Some(Err(e));
+            }
+            Ok(json!({"reading": true, "path": path}))
         }
         "app.quit" => {
             app.ui.quit = true;
