@@ -968,7 +968,20 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 None => app.services.pick_lightroom_catalog.as_mut().and_then(|f| f().into_iter().next()),
             };
             let Some(path) = path else { return Some(Ok(Value::Null)) };
-            app.run("library.importLightroomCatalog", json!({"path": path}))
+            app.ui.status = format!("Importing Lightroom catalog: {}", path);
+            // Dispatch directly to the engine. Calling `app.run` here would
+            // re-enter this UI command handler with the same id indefinitely.
+            let result = app.session.execute("library.importLightroomCatalog", &json!({"path": path})).map_err(|e| e.to_string());
+            if let Err(e) = &result {
+                log::warn!("library.importLightroomCatalog: {e}");
+                app.ui.status = e.clone();
+            } else if let Ok(report) = &result {
+                let imported = report["imported"].as_array().map_or(0, Vec::len);
+                let failed = report["failed"].as_array().map_or(0, Vec::len);
+                let xmp = report["xmpApplied"].as_u64().unwrap_or(0);
+                app.ui.status = format!("Lightroom catalog imported: {imported} photo(s), {xmp} metadata record(s), {failed} failed");
+            }
+            result
         }
         "app.quit" => {
             app.ui.quit = true;

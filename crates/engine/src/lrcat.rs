@@ -38,12 +38,16 @@ enum Value {
     Integer(i64),
     Text(String),
     Blob(Vec<u8>),
-    Real,
+    Real(f64),
 }
 
 impl Value {
     fn int(&self) -> Option<i64> {
-        if let Self::Integer(v) = self { Some(*v) } else { None }
+        match self {
+            Self::Integer(v) => Some(*v),
+            Self::Real(v) if v.is_finite() && v.fract() == 0.0 && *v >= i64::MIN as f64 && *v <= i64::MAX as f64 => Some(*v as i64),
+            _ => None,
+        }
     }
     fn text(&self) -> Option<&str> {
         if let Self::Text(v) = self { Some(v) } else { None }
@@ -60,7 +64,14 @@ impl Catalog {
         if meta.len() > MAX_CATALOG_BYTES {
             return Err(format!("{} is larger than the 4 GiB Lightroom import limit", path.display()));
         }
-        let db = Db::new(std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?)?;
+        let mut bytes = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+        // Lightroom commonly leaves recent catalog pages in the SQLite WAL. Overlay the latest
+        // committed frame for each page without opening or modifying the source files.
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        if let Ok(wal_bytes) = std::fs::read(&wal) {
+            overlay_wal(&mut bytes, &wal_bytes)?;
+        }
+        let db = Db::new(bytes)?;
         let mut tables = HashMap::new();
         for row in db.table_rows(1)? {
             let Some(kind) = row.first().and_then(Value::text) else { continue };
@@ -87,14 +98,14 @@ impl Catalog {
     pub fn entries(&self) -> Result<Vec<Entry>, String> {
         let roots = self.rows("AgLibraryRootFolder")?;
         let folders = self.rows("AgLibraryFolder")?;
-        let files = self.rows("AgLibraryFile")?;
+        let files_rows = self.rows("AgLibraryFile")?;
         let images = self.rows("Adobe_images")?;
         let packets = if self.tables.contains_key("Adobe_AdditionalMetadata") { self.rows("Adobe_AdditionalMetadata")? } else { Vec::new() };
 
         let roots: HashMap<i64, String> = roots.iter().filter_map(|r| Some((id(r)?, text(r, "absolutePath")?.to_string()))).collect();
         let folders: HashMap<i64, (i64, String)> =
             folders.iter().filter_map(|r| Some((id(r)?, (integer(r, "rootFolder")?, text(r, "pathFromRoot").unwrap_or("").to_string())))).collect();
-        let files: HashMap<i64, (i64, String)> = files
+        let files: HashMap<i64, (i64, String)> = files_rows
             .iter()
             .filter_map(|r| {
                 let name = text(r, "originalFilename").filter(|s| !s.is_empty()).map(str::to_string).or_else(|| {
@@ -114,12 +125,35 @@ impl Catalog {
         let mut seen = HashSet::new();
         for image in images {
             let (Some(image_id), Some(file_id)) = (id(&image), integer(&image, "rootFile").or_else(|| integer(&image, "file"))) else { continue };
-            let Some((folder_id, name)) = files.get(&file_id) else { continue };
+            let Some((folder_id, name)) = files.get(&file_id) else {
+                // Some Lightroom generations keep a complete path on the image/file row.
+                if let Some(path) = text(&image, "absolutePath").or_else(|| text(&image, "path")).filter(|p| !p.is_empty()) {
+                    if seen.insert(path.to_string()) {
+                        out.push(Entry { path: path.to_string(), xmp: packets.get(&image_id).cloned() });
+                    }
+                }
+                continue;
+            };
             let Some((root_id, relative)) = folders.get(folder_id) else { continue };
             let Some(root) = roots.get(root_id) else { continue };
             let path = PathBuf::from(root).join(relative.trim_start_matches(['/', '\\'])).join(name).to_string_lossy().to_string();
             if seen.insert(path.clone()) {
                 out.push(Entry { path, xmp: packets.get(&image_id).cloned() });
+            }
+        }
+        // A few catalogs omit the folder relation but retain an absolute path on AgLibraryFile.
+        if out.is_empty() {
+            for (file_id, (_folder, name)) in &files {
+                let Some(row) = files_rows.iter().find(|r| id(r) == Some(*file_id)) else { continue };
+                let Some(path) = text(row, "absolutePath").or_else(|| text(row, "path")).filter(|p| !p.is_empty()) else { continue };
+                let path = if Path::new(path).extension().is_some() {
+                    path.to_string()
+                } else {
+                    PathBuf::from(path).join(name).to_string_lossy().to_string()
+                };
+                if seen.insert(path.clone()) {
+                    out.push(Entry { path, xmp: None });
+                }
             }
         }
         if out.is_empty() {
@@ -209,8 +243,11 @@ impl Db {
                 let off = be16(page.get(at..at + 2).ok_or("truncated SQLite cell pointer")?)? as usize;
                 let cell = page.get(off..).ok_or("SQLite cell lies outside its page")?;
                 let (size, a) = varint(cell)?;
-                let (_, b) = varint(cell.get(a..).ok_or("truncated SQLite rowid")?)?;
-                out.push(record(&self.payload(page_no, off, size as usize, a + b)?)?);
+                let (rowid, b) = varint(cell.get(a..).ok_or("truncated SQLite rowid")?)?;
+                let values = record(&self.payload(page_no, off, size as usize, a + b)?)?;
+                // `INTEGER PRIMARY KEY` is an alias for SQLite's rowid, so its on-page record
+                // field is NULL. Lightroom uses this for every foreign-key join (`id_local`).
+                out.push(with_rowid(values, rowid));
             }
         }
         Ok(out)
@@ -311,7 +348,7 @@ fn serial(kind: u64, b: &[u8]) -> Result<(Value, usize), String> {
     let data = b.get(..n).ok_or("truncated SQLite field")?;
     let value = match kind {
         1..=6 => Value::Integer(signed(data)),
-        7 => Value::Real,
+        7 => Value::Real(f64::from_bits(u64::from_be_bytes(data.try_into().map_err(|_| "invalid SQLite real")?))),
         k if k % 2 == 0 => Value::Blob(data.to_vec()),
         _ => Value::Text(String::from_utf8_lossy(data).into_owned()),
     };
@@ -362,4 +399,40 @@ mod tests {
         let names = columns("CREATE TABLE sample (id_local INTEGER PRIMARY KEY, name TEXT, UNIQUE(name))");
         assert_eq!(names, ["id_local", "name"]);
     }
+
+    #[test]
+    fn integer_primary_key_uses_sqlite_rowid() {
+        let values = with_rowid(vec![Value::Null, Value::Text("photo".into())], 42);
+        assert!(matches!(values.first(), Some(Value::Integer(42))));
+        let values = with_rowid(vec![Value::Integer(7)], 42);
+        assert!(matches!(values.first(), Some(Value::Integer(7))));
+    }
+}
+
+fn with_rowid(mut values: Vec<Value>, rowid: u64) -> Vec<Value> {
+    if matches!(values.first(), Some(Value::Null)) && rowid <= i64::MAX as u64 {
+        values[0] = Value::Integer(rowid as i64);
+    }
+    values
+}
+
+fn overlay_wal(db: &mut [u8], wal: &[u8]) -> Result<(), String> {
+    if wal.len() < 32 || wal.get(..4) != Some(&[0x37, 0x7f, 0x06, 0x82]) {
+        return Ok(());
+    }
+    let page_size = u32::from_be_bytes(wal[8..12].try_into().map_err(|_| "invalid SQLite WAL header")?) as usize;
+    if !(512..=65_536).contains(&page_size) || wal.len() < 32 + 24 + page_size {
+        return Ok(());
+    }
+    let mut at = 32usize;
+    while at.checked_add(24 + page_size).is_some_and(|end| end <= wal.len()) {
+        let page_no = u32::from_be_bytes(wal[at..at + 4].try_into().map_err(|_| "invalid SQLite WAL frame")?) as usize;
+        let src = &wal[at + 24..at + 24 + page_size];
+        let dst_start = page_no.saturating_sub(1).saturating_mul(page_size);
+        if page_no > 0 && dst_start.checked_add(page_size).is_some_and(|end| end <= db.len()) {
+            db[dst_start..dst_start + page_size].copy_from_slice(src);
+        }
+        at += 24 + page_size;
+    }
+    Ok(())
 }

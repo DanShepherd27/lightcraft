@@ -825,6 +825,11 @@ impl LightcraftApp {
         export_task::poll(self, &ctx);
         panels::grid::drag_feedback(self, &ctx);
         panels::toast(self, &ctx);
+        if !self.ui.status.is_empty() {
+            egui::Area::new("operation-status".into()).fixed_pos(egui::pos2(18.0, 92.0)).show(&ctx, |ui| {
+                ui.label(egui::RichText::new(&self.ui.status).color(egui::Color32::WHITE).background_color(egui::Color32::from_black_alpha(190)));
+            });
+        }
         self.widgets = widgets::take_registry(&ctx);
         self.end_frame(t0);
     }
